@@ -1,15 +1,19 @@
 use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use teloxide::{prelude::*, utils::command::BotCommands};
+use tokio::fs;
 use tokio::sync::RwLock;
+use toml::Table;
 
+#[derive(Serialize, Deserialize)]
 struct User {
     chat_id: ChatId,
     name: String,
     username: String,
+    is_admin: bool,
 }
-
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", parse_with = "split")]
 enum Command {
@@ -22,7 +26,9 @@ enum Command {
     Help,
 }
 
-static STUDENTS: LazyLock<RwLock<HashMap<ChatId, String>>> =
+static STUDENTS: LazyLock<RwLock<HashMap<ChatId, User>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static ADMINS: LazyLock<RwLock<HashMap<ChatId, User>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 //TODO:  tokio::sync::RwLock drop(guard)
 static QUEUE: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(Vec::new()));
@@ -34,6 +40,7 @@ async fn main() {
     log::info!("Запускаем бота...");
     //$env:TELOXIDE_TOKEN = "TOKEN"
     //$env:RUST_LOG="info"
+    parse_and_init().await;
     let bot = Bot::from_env();
     Command::repl(bot, action).await;
     /*
@@ -47,10 +54,59 @@ async fn main() {
      */
 }
 
+async fn parse_and_init() {
+    log::info!("Начинаем читать файл конфигурации...");
+    let config_name = "config.toml";
+    let config = fs::read_to_string(config_name).await;
+
+    match config {
+        Ok(config) => {
+            log::info!("{}", config);
+            let mut adm = ADMINS.write().await;
+            let res = config.parse::<Table>();
+
+            match res {
+                Ok(table) => {
+                    let users = table["admins"].as_array().unwrap();
+                    for user in users.iter() {
+                        let admin = User  {
+                            chat_id: ChatId(user["chat_id"].as_integer().unwrap()),
+                            name: user["name"].as_str().unwrap().to_string(),
+                            username: user["username"].as_str().unwrap().to_string(),
+                            is_admin: user["is_admin"].as_bool().unwrap(),
+                        };
+
+
+                        adm.insert(admin.chat_id, admin);
+                    }
+                }
+                Err(err) => {
+                    log::warn!("Не удалось прочитать админов - {}", err);
+                }
+            }
+        }
+        Err(err) => {
+            log::warn!("Не удалось прочитать админов - {}", err);
+        }
+    }
+}
+
 async fn action(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
     {
         let name_for_logger: String = msg.from.clone().unwrap().first_name;
-        log::info!("Поступило сообщение от {}. Username:{} . Команда: {}",name_for_logger,msg.from.as_ref().unwrap().username.as_ref().unwrap().as_str(), msg.text().unwrap());
+        log::info!(
+            "Поступило сообщение от {}. Username:@{}. chatId: {}. Команда: {}",
+            name_for_logger,
+            msg.from
+                .as_ref()
+                .unwrap()
+                .username
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            msg.chat.id,
+            msg.text().unwrap()
+        );
     }
     match cmd {
         Command::Help | Command::Start => {
@@ -58,7 +114,7 @@ async fn action(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
             Он работает рандомизированным способом: первичный вид очереди определяется рандомом. Далее студни могут обменяться местами(я этого не делал), если хотят подойти в начале/конце практики.\n\
             Доступные команды:\n/addme - добавить вас в список студней\n\
             /deleteme - удалить вас из списка студней\n\
-            /createqueue - создать общую очередь для всех ( затирает прошлую )\n\
+            /createqueue - [только для админов] создать общую очередь для всех ( затирает прошлую )\n\
             /showqueue - показать общую очередь для всех\n\
             /info - показать зарегистрированных пользователей ( в будущем метрику хз )\n\
             /help - ну...блин)").await?;
@@ -91,20 +147,37 @@ async fn add_me(bot: Bot, msg: Message) -> ResponseResult<()> {
         let map = STUDENTS.read().await;
         map.contains_key(&msg.chat.id)
     };
-
-    if !user_cont  {
+    if !user_cont {
         let mut map = STUDENTS.write().await;
-        let user = msg.from.unwrap();
-        let first = user.first_name;
-        let last = user.last_name.unwrap_or_default();
+        let user = msg.from.as_ref().unwrap();
+        let first = user.first_name.clone();
+        let last = user.last_name.clone().unwrap_or_default().clone();
         let username = format!("{} {}", first, last);
-        map.insert(msg.chat.id, username.clone());
+        let student = User {
+            chat_id: msg.chat.id,
+            name: username.clone(),
+            username: msg
+                .from
+                .as_ref()
+                .unwrap()
+                .username
+                .as_ref()
+                .unwrap()
+                .clone(),
+            is_admin: false,
+        };
+        map.insert(msg.chat.id, student);
         let mut q = QUEUE.write().await;
         q.push(username);
     } else {
-        bot.send_message(msg.chat.id, "Погоди, ты уже зарегистрирован. Зачем тебе все это.........???").await?;
+        bot.send_message(
+            msg.chat.id,
+            "Погоди, ты уже зарегистрирован. Зачем тебе все это.........???",
+        )
+        .await?;
     }
-    bot.send_message(msg.chat.id, "Done (добавлен в конец очереди)").await?;
+    bot.send_message(msg.chat.id, "Done (добавлен в конец очереди)")
+        .await?;
     Ok(())
 }
 
@@ -112,10 +185,10 @@ async fn delete_me(bot: Bot, msg: Message) -> ResponseResult<()> {
     let (user_cont, user_fl_name) = {
         let map = STUDENTS.read().await;
         let is_user_cont = map.contains_key(&msg.chat.id);
-        let cht_id : ChatId;
+        let cht_id: ChatId;
         let mut user_fl_name_local: String = "".to_string();
         if is_user_cont {
-            user_fl_name_local =  map[&msg.chat.id].clone();
+            user_fl_name_local = map[&msg.chat.id].name.clone();
         }
         //(map.contains_key(&msg.chat.id), map[&msg.chat.id].clone())
         (is_user_cont, user_fl_name_local)
@@ -124,7 +197,6 @@ async fn delete_me(bot: Bot, msg: Message) -> ResponseResult<()> {
     if user_cont {
         let mut map = STUDENTS.write().await;
         let mut q = QUEUE.write().await;
-
 
         let index = {
             let mut some_inx: usize = 0; //МММ как умом вот я умный ммм умом да очень умно ммм
@@ -140,19 +212,36 @@ async fn delete_me(bot: Bot, msg: Message) -> ResponseResult<()> {
 
         map.remove(&msg.chat.id);
     }
-    bot.send_message(msg.chat.id, "Done (Удален из текущей очереди иииии...зарегистрированных пльзвтлй)").await?;
+    bot.send_message(
+        msg.chat.id,
+        "Done (Удален из текущей очереди иииии...зарегистрированных пльзвтлй)",
+    )
+    .await?;
     Ok(())
 }
 
 async fn info(bot: Bot, msg: Message) -> ResponseResult<()> {
     let a: String = {
-        let map = STUDENTS.read().await;
+        let map = ADMINS.read().await;
         let mut res: String = String::new();
-        res.push_str("Список зарегистрированных пльзвтлй\n");
-        let mut cnt: u32 = 0;
-        for name in map.values() {
+        let mut cnt: u32 = 1;
+        res.push_str("Админы с правом перемешивать очередь\n");
+        for user in map.values() {
             res.push_str(format!("№{} ", cnt).as_str());
-            res.push_str(name);
+            res.push_str(user.name.as_str());
+            res.push_str(" || @");
+            res.push_str(user.username.as_str());
+            res.push_str("\n");
+            cnt += 1;
+        }
+        let map = STUDENTS.read().await;
+        res.push_str("Список зарегистрированных пльзвтлй\n");
+        cnt = 1;
+        for user in map.values() {
+            res.push_str(format!("№{} ", cnt).as_str());
+            res.push_str(user.name.as_str());
+            res.push_str(" || @");
+            res.push_str(user.username.as_str());
             res.push_str("\n");
             cnt += 1;
         }
@@ -170,12 +259,21 @@ async fn info(bot: Bot, msg: Message) -> ResponseResult<()> {
 
 async fn create_queue(bot: Bot, msg: Message) -> ResponseResult<()> {
     {
+        let mut map = ADMINS.read().await;
+        if !map.contains_key(&msg.chat.id) {
+            bot.send_message(msg.chat.id, "Эй, ты не админ...фу...")
+                .await?;
+            return Ok(());
+        }
+    }
+
+    {
         let mut q = QUEUE.write().await;
         q.clear();
         let map = STUDENTS.read().await;
 
-        for name in map.values() {
-            q.push(name.clone())
+        for user in map.values() {
+            q.push(user.name.clone());
         }
         let mut rng = rand::rng();
         q.shuffle(&mut rng);
@@ -183,8 +281,8 @@ async fn create_queue(bot: Bot, msg: Message) -> ResponseResult<()> {
     let v: Vec<(ChatId, String)> = {
         let map = STUDENTS.read().await;
         let mut res = Vec::new();
-        for (id, name) in map.iter() {
-            res.push((id.clone(), name.clone()));
+        for (id, user) in map.iter() {
+            res.push((id.clone(), user.name.clone()));
         }
         res
     };
@@ -223,9 +321,9 @@ async fn show_queue(bot: Bot, msg: Message) -> ResponseResult<()> {
         if vec.is_empty() {
             res = "Очередь пуста".to_string();
         } else {
-            let mut cnt: u32 = 0;
+            let mut cnt: u32 = 1;
             for name in vec.iter() {
-                res.push_str(format!("[{}] --> {}\n",cnt ,name).as_str());
+                res.push_str(format!("[{}] --> {}\n", cnt, name).as_str());
                 cnt += 1;
             }
         }
