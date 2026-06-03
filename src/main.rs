@@ -14,6 +14,11 @@ struct User {
     username: String,
     is_admin: bool,
 }
+
+#[derive(Serialize, Deserialize)]
+struct Admins {
+    admins: Vec<User>,
+}
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", parse_with = "split")]
 enum Command {
@@ -57,27 +62,16 @@ async fn main() {
 async fn parse_and_init() {
     log::info!("Начинаем читать файл конфигурации...");
     let config_name = "config.toml";
-    let config = fs::read_to_string(config_name).await;
 
-    match config {
+    match fs::read_to_string(config_name).await {
         Ok(config) => {
             log::info!("{}", config);
             let mut adm = ADMINS.write().await;
-            let res = config.parse::<Table>();
 
-            match res {
-                Ok(table) => {
-                    let users = table["admins"].as_array().unwrap();
-                    for user in users.iter() {
-                        let admin = User  {
-                            chat_id: ChatId(user["chat_id"].as_integer().unwrap()),
-                            name: user["name"].as_str().unwrap().to_string(),
-                            username: user["username"].as_str().unwrap().to_string(),
-                            is_admin: user["is_admin"].as_bool().unwrap(),
-                        };
-
-
-                        adm.insert(admin.chat_id, admin);
+            match toml::from_str::<Admins>(&config) {
+                Ok(arr) => {
+                    for user in arr.admins {
+                        adm.insert(user.chat_id, user);
                     }
                 }
                 Err(err) => {
