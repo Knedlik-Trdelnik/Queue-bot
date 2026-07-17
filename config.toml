@@ -1,18 +1,9 @@
+limit = 35 #any >= 0
+
 [[admins]]
 chat_id = 1
-name = "]]]]]]]]"
-username = "1"
+name = "A"
+username = "B" #TG username without @
 is_admin = true
-
-[[admins]]
-chat_id = 2
-name = "[[[[[[[["
-username = "2"
-is_admin = true
-
-[[admins]]
-chat_id = 3
-name = "{{{{{{"
-username = "3"
-is_admin = true
+swap_pos = 0
 

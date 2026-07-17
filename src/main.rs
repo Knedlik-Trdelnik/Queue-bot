@@ -6,7 +6,8 @@ use teloxide::types::FileId;
 use teloxide::types::InputFile;
 use teloxide::{prelude::*, utils::command::BotCommands};
 use tokio::fs;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock};
+use toml::Table;
 
 #[derive(Serialize, Deserialize)]
 struct User {
@@ -34,6 +35,7 @@ enum Command {
     Swap(usize),
     Ban(String),
     Unban(String),
+    Del(usize),
 }
 
 static STUDENTS: LazyLock<RwLock<HashMap<ChatId, User>>> =
@@ -43,8 +45,12 @@ static ADMINS: LazyLock<RwLock<HashMap<ChatId, User>>> =
 //TODO:  tokio::sync::RwLock drop(guard)
 static QUEUE: LazyLock<RwLock<Vec<ChatId>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 //TODO: избавиться от множественных клонирований. В queue хватит &str
-static BANNED: LazyLock<RwLock<HashSet<ChatId>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
+static BANNED: LazyLock<RwLock<HashMap<ChatId, String>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 //Забаненные пользователи
+
+static LIMIT: LazyLock<RwLock<usize>> = LazyLock::new(|| RwLock::new(0));
+//Лимит людей в очереди. По умолчанию - 50
 
 #[tokio::main]
 async fn main() {
@@ -90,9 +96,18 @@ async fn parse_and_init() {
                     log::warn!("Не удалось прочитать админов - {}", err);
                 }
             }
+
+            let mut lim = LIMIT.write().await;
+            let values = config.parse::<Table>().unwrap();
+
+            *lim = values["limit"].as_integer().unwrap_or(50) as usize;
         }
+
         Err(err) => {
-            log::warn!("Не удалось прочитать админов - {}", err);
+            log::warn!(
+                "Не удалось прочитать админов и параметры конфигурации - {}",
+                err
+            );
         }
     }
 }
@@ -116,7 +131,7 @@ async fn action(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
     }
     {
         let prisoners = BANNED.read().await;
-        if prisoners.contains(&msg.chat.id) {
+        if prisoners.contains_key(&msg.chat.id) {
             bot.send_message(msg.chat.id, "Упс...а ты забанен").await?;
             return Ok(());
         }
@@ -133,6 +148,7 @@ async fn action(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
             /swap [число] - предложить свапнуться со студнем на месте [чиcло]\n\
             /ban - [только для админов] [юзернейм] без @ - забанить зарегистрированного))))\n\
             /unban - [только для админов] [юзернем] без @))))\n\
+            /del [число] - выкинуть и удалить человека (у которога в очереди [число] место) из зарегестрированных пользователей\n
             /help - ну...блин)").await?;
             let sticker_id = FileId(
                 "CAACAgIAAxkBAAIG12opX911iwkw7Xaqk3FCqak_OdosAALBaAAC956BScJug_m8nC63OwQ"
@@ -164,6 +180,9 @@ async fn action(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
             ban(bot, msg, user_name).await?;
         }
         Command::Unban(user_name) => unban(bot, msg, user_name).await?,
+        Command::Del(position) => {
+            del(bot, msg, position - 1).await?;
+        }
     }
 
     Ok(())
@@ -179,6 +198,19 @@ async fn add_me(bot: Bot, msg: Message) -> ResponseResult<()> {
     };
     if !user_cont {
         let mut map = STUDENTS.write().await;
+
+        {
+            let lim = LIMIT.read().await;
+            if map.len() >= *lim {
+                bot.send_message(
+                    msg.chat.id,
+                    "Лимит зарегестрированных пользователей достигнут...Пора уже кого-то удалять",
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
         let user = msg.from.as_ref().unwrap();
         let first = user.first_name.clone();
         let last = user.last_name.clone().unwrap_or_default().clone();
@@ -263,13 +295,24 @@ async fn info(bot: Bot, msg: Message) -> ResponseResult<()> {
             cnt += 1;
         }
         let map = STUDENTS.read().await;
-        res.push_str("Список зарегистрированных пльзвтлй\n");
+        res.push_str("\nСписок зарегистрированных пльзвтлй\n");
         cnt = 1;
         for user in map.values() {
             res.push_str(format!("№{} ", cnt).as_str());
             res.push_str(user.name.as_str());
             res.push_str(" || @");
             res.push_str(user.username.as_str());
+            res.push_str("\n");
+            cnt += 1;
+        }
+
+        res.push_str("\nСписок забаненных пльзвтлй\n");
+        let banned = BANNED.read().await;
+        cnt = 1;
+        for user in banned.values() {
+            res.push_str(format!("№{} ", cnt).as_str());
+            res.push_str(" || @");
+            res.push_str(user.as_str());
             res.push_str("\n");
             cnt += 1;
         }
@@ -393,6 +436,16 @@ async fn find_user_by_name(un: &String) -> Result<ChatId, String> {
     Err(format!("Пользователь с именем {} не найден", un))
 }
 
+async fn find_banned_by_name(un: &String) -> Result<ChatId, String> {
+    let map = BANNED.read().await;
+    for (key, value) in &*map {
+        if un.eq(value) {
+            return Ok(*key);
+        }
+    }
+    Err(format!("Пользователь с именем {} не найден", un))
+}
+
 async fn ban(bot: Bot, msg: Message, user_name: String) -> ResponseResult<()> {
     if !is_user_admin(&msg.chat.id).await {
         bot.send_message(msg.chat.id, "Эй, ты не админ...фу...")
@@ -417,9 +470,11 @@ async fn ban(bot: Bot, msg: Message, user_name: String) -> ResponseResult<()> {
                     .await?;
                 return Ok(());
             }
-
+            {
             let mut prisoners = BANNED.write().await;
-            prisoners.insert(id);
+            let students = STUDENTS.read().await;
+            prisoners.insert(id, students.get(&id).unwrap().username.clone());
+            }
             delete_user(id).await;
             bot.send_message(msg.chat.id, "Забанен!").await?;
             return Ok(());
@@ -443,20 +498,16 @@ async fn unban(bot: Bot, msg: Message, user_name: String) -> ResponseResult<()> 
         return Ok(());
     };
 
-    match find_user_by_name(&user_name).await {
+    match find_banned_by_name(&user_name).await {
         Ok(id) => {
             let mut prisoners = BANNED.write().await;
-            if !prisoners.contains(&id) {
-                bot.send_message(msg.chat.id, "Он(а) не был(а) забанен(а)...")
-                    .await?;
-                return Ok(());
-            }
             prisoners.remove(&id);
             bot.send_message(msg.chat.id, "Разбанен(а)...!").await?;
             Ok(())
         }
         Err(err) => {
-            bot.send_message(msg.chat.id, err).await?;
+            bot.send_message(msg.chat.id, "Он(а) не был(а) забанен(а)...")
+                .await?;
             Ok(())
         }
     }
@@ -505,7 +556,7 @@ async fn swap(bot: Bot, msg: Message, position: usize) -> ResponseResult<()> {
     {
         let mut queue = QUEUE.write().await;
 
-        if pos  >= queue.len() {
+        if pos >= queue.len() {
             bot.send_message(
                 msg.chat.id,
                 format!(
@@ -532,14 +583,18 @@ async fn swap(bot: Bot, msg: Message, position: usize) -> ResponseResult<()> {
     }
     if is_swapped {
         bot.send_message(msg.chat.id, "Свап выполнен").await?;
-        bot.send_message(victim_id, format!("Свап с {} подтвержден", index_of_sender + 1))
-            .await?;
+        bot.send_message(
+            victim_id,
+            format!("Свап с {} подтвержден", index_of_sender + 1),
+        )
+        .await?;
     } else {
         bot.send_message(
             victim_id,
             format!(
                 "Тебе предложил свап c позицией {}.\nДля подтверждения отправь [/swap {}]",
-                index_of_sender+ 1 , index_of_sender + 1
+                index_of_sender + 1,
+                index_of_sender + 1
             ),
         )
         .await?;
@@ -555,4 +610,14 @@ async fn is_user_admin(id: &ChatId) -> bool {
         return false;
     }
     true
+}
+
+async fn del(bot: Bot, msg: Message, index: usize) -> ResponseResult<()> {
+    let mut map = STUDENTS.write().await;
+    let mut q = QUEUE.write().await;
+
+    map.remove(&q[index]);
+    q.remove(index);
+    bot.send_message( msg.chat.id,"Отправлен в пекло!").await?;
+    Ok(())
 }
